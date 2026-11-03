@@ -112,7 +112,7 @@ export function passiveBoardRecovery(alias: string): string {
   return `${alias}.status IN ('active', 'escalated') AND ${alias}.resolved_at IS NULL
     AND ${alias}.owner_type = 'board' AND ${alias}.owner_agent_id IS NULL
     AND ${alias}.kind IN ('stranded_assigned_issue', 'missing_disposition')
-    AND ${alias}.cause IN ('stranded_assigned_issue', 'successful_run_missing_state', 'issue_review_path_lost')
+    AND ${alias}.cause IN ('stranded_assigned_issue', 'successful_run_missing_state', 'issue_review_path_lost', 'stage_handoff_retry_exhausted')
     AND ${alias}.recovery_issue_id IS NULL AND ${alias}.monitor_policy IS NULL AND ${alias}.timeout_at IS NULL
     AND jsonb_typeof(${alias}.wake_policy) = 'object'
     AND ${alias}.wake_policy->>'type' = 'board_escalation'
@@ -120,11 +120,17 @@ export function passiveBoardRecovery(alias: string): string {
     AND COALESCE(${alias}.wake_policy->>'preservesSourceAssignee', 'true') = 'true'
     AND EXISTS (SELECT 1 FROM issues recovery_source
       WHERE recovery_source.id = ${alias}.source_issue_id AND recovery_source.company_id = ${alias}.company_id
-        AND recovery_source.status = 'blocked'
+        AND (recovery_source.status = 'blocked' OR (${alias}.cause = 'stage_handoff_retry_exhausted'
+          AND recovery_source.status IN ('todo', 'in_progress', 'in_review')))
         AND recovery_source.checkout_run_id IS NULL AND recovery_source.execution_run_id IS NULL
         AND recovery_source.conversation_agent_id IS NULL
         AND recovery_source.monitor_next_check_at IS NULL AND recovery_source.monitor_wake_requested_at IS NULL
-        AND (recovery_source.execution_state IS NULL OR recovery_source.execution_state->>'status' = 'idle')
+        AND (recovery_source.execution_state IS NULL OR recovery_source.execution_state->>'status' = 'idle'
+          OR (${alias}.cause = 'stage_handoff_retry_exhausted'
+            AND recovery_source.execution_state->>'status' = 'pending'
+            AND recovery_source.execution_state->>'currentStageId' = ${alias}.evidence->>'stageId'
+            AND recovery_source.assignee_agent_id = ${alias}.return_owner_agent_id
+            AND ${alias}.evidence#>>'{stageHandoffRetry,state}' = 'exhausted'))
         AND COALESCE(recovery_source.execution_policy->'monitor', 'null'::jsonb) = 'null'::jsonb)`;
 }
 

@@ -823,6 +823,8 @@ export interface WakeupOptions {
     statuses: string[];
     assigneeAgentId: string;
     statusVersion?: number;
+    /** The pending execution stage the wake was built for. */
+    executionStageId?: string;
     monitorNextCheckAt?: string;
     monitorWakeRequestedAt?: string;
     /** Internal diagnostic only; the callback cannot grant admission. */
