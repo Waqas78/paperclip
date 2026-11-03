@@ -5,6 +5,26 @@ import type { createDeliveryWorkCoordinator } from "../delivery-work-coordinator
 import { DELIVERY_QUEUES } from "../delivery-work-notifications.js";
 import type { DeferredExecutionScope, DeferredReceiptRecoveryOptions } from "../deferred-execution-notifications.js";
 import { registerScopedDeadlineWork } from "../scoped-deadline-work.js";
+import { stageHandoffRetryDueAt } from "../execution-wait.js";
+
+// Only unretired stage handoffs still owned by the same pending participant.
+// Completed/parked history must not keep the shared worker active.
+function blockedStageHandoff() {
+  return sql<boolean>`${agentWakeupRequests.status} = 'skipped'
+    and ${agentWakeupRequests.reason} = 'execution_reconciliation_required'
+    and ${agentWakeupRequests.payload}->'executionWait' is not null
+    and ${agentWakeupRequests.payload}#>>'{executionWait,recoveryActionId}' is null
+    and ${agentWakeupRequests.payload}#>>'{executionWait,readmittedAt}' is null
+    and exists (select 1 from issues i join companies c on c.id = i.company_id
+      where i.company_id = ${agentWakeupRequests.companyId} and c.status = 'active'
+        and i.id::text = ${agentWakeupRequests.payload}->>'issueId'
+        and i.assignee_agent_id = ${agentWakeupRequests.agentId}
+        and i.execution_run_id is null
+        and i.status in ('todo', 'in_progress', 'in_review', 'blocked')
+        and i.execution_state->>'status' = 'pending'
+        and i.execution_state->>'currentStageId' = ${agentWakeupRequests.payload}#>>'{executionStage,stageId}'
+        and i.execution_state#>>'{currentParticipant,agentId}' = ${agentWakeupRequests.agentId}::text)`;
+}
 
 type Entry = { id: string; companyId: string; dueAt: number };
 type NativeIntentOptions = DeferredExecutionScope & {
@@ -44,6 +64,7 @@ export function registerDeferredReceiptWork(
         if (!enabled) { cursors.delete(key); return []; }
         const cursor = cursors.get(key);
         const rows = await db.select({ id: agentWakeupRequests.id, companyId: agentWakeupRequests.companyId,
+          payload: agentWakeupRequests.payload,
           status: agentWakeupRequests.status, updatedAt: agentWakeupRequests.updatedAt,
           claimedAt: agentWakeupRequests.claimedAt, error: agentWakeupRequests.error,
           delayed: sql<boolean>`${agentWakeupRequests.payload}->'queuedCommentInterrupt' is not null
@@ -60,7 +81,8 @@ export function registerDeferredReceiptWork(
             eq(agentWakeupRequests.requestedByActorType, "system"),
             eq(agentWakeupRequests.requestedByActorId, "native-status-committer"),
             inArray(agentWakeupRequests.status, ["queued", "claimed"]), isNull(agentWakeupRequests.runId),
-          ) : and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
+          ) : or(kind === "deferred" ? blockedStageHandoff() : undefined,
+            and(eq(agentWakeupRequests.status, "deferred_issue_execution"),
             kind === "task_chat" ? and(eq(agentWakeupRequests.reason, "task_retry"),
               sql`${agentWakeupRequests.payload}#>>'{taskRetry,chatActionId}' is not null`) : or(
               eq(agentWakeupRequests.reason, "task_retry"),
@@ -72,22 +94,25 @@ export function registerDeferredReceiptWork(
               sql`exists (select 1 from heartbeat_runs r where r.company_id = ${agentWakeupRequests.companyId}
                 and r.runtime_mode = 'legacy' and r.status = 'cancelled'
                 and r.result_json->>'queuedCommentInterruptQueueId' = ${agentWakeupRequests.id}::text)`,
-            )),
+            ))),
         )).orderBy(asc(agentWakeupRequests.id)).limit(100);
         const complete = rows.length < 100;
         if (complete) cursors.delete(key); else cursors.set(key, rows.at(-1)!.id);
         return { rows: rows.map(row => ({ id: row.id, companyId: row.companyId,
           dueAt: kind === "native" && row.status === "claimed" && row.claimedAt ? row.claimedAt.getTime() + 60_000
             : kind === "native" && row.error ? row.updatedAt.getTime() + 30_000
+            : kind === "deferred" && row.status === "skipped" ? stageHandoffRetryDueAt(row.payload, row.updatedAt) ?? Date.now()
             : kind === "deferred" && row.delayed && !row.interruptedLegacy ? row.updatedAt.getTime() + 30_000
             : Date.now(),
         })), complete };
       },
       check: async entry => {
         if (!enabled) return null;
+        let stageHandoff = false;
         if (kind !== "task_chat") {
           const [current] = await db.select({ status: agentWakeupRequests.status, payload: agentWakeupRequests.payload,
             updatedAt: agentWakeupRequests.updatedAt, claimedAt: agentWakeupRequests.claimedAt, error: agentWakeupRequests.error,
+            stageHandoff: blockedStageHandoff(),
             interruptedLegacy: sql<boolean>`exists (select 1 from heartbeat_runs r
               where r.company_id = ${agentWakeupRequests.companyId} and r.agent_id = ${agentWakeupRequests.agentId}
                 and r.runtime_mode = 'legacy' and r.status = 'cancelled'
@@ -95,10 +120,13 @@ export function registerDeferredReceiptWork(
           }).from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
             eq(agentWakeupRequests.id, entry.id)));
           if (!current) return null;
+          stageHandoff = current.stageHandoff;
+          if (kind === "deferred" && current.status === "skipped" && !current.stageHandoff) return null;
           const due = kind === "native" && current.status === "claimed" && current.claimedAt
             ? current.claimedAt.getTime() + 60_000
+            : kind === "deferred" && current.stageHandoff ? stageHandoffRetryDueAt(current.payload, current.updatedAt)
             : kind === "native" && current.status === "queued" && current.error ? current.updatedAt.getTime() + 30_000
-              : kind === "deferred" && current.status === "deferred_issue_execution" && !current.interruptedLegacy
+              : kind === "deferred" && (current.status === "deferred_issue_execution" || current.stageHandoff) && !current.interruptedLegacy
                 && (current.payload?.queuedCommentInterrupt || current.payload?.executionWait)
                 ? current.updatedAt.getTime() + 30_000 : null;
           if (due !== null && due > Date.now()) return { ...entry, dueAt: due };
@@ -115,6 +143,12 @@ export function registerDeferredReceiptWork(
           const failed = (error: unknown) => { if (!(error instanceof PersistedExecutionWaitRefusal)) errors.push(error); };
           try { await owner.resume({ ...scope, onError: failed }); }
           catch (error) { failed(error); }
+          if (stageHandoff) {
+            const [pendingStage] = await db.select({ updatedAt: agentWakeupRequests.updatedAt, payload: agentWakeupRequests.payload })
+              .from(agentWakeupRequests).where(and(eq(agentWakeupRequests.companyId, entry.companyId),
+                eq(agentWakeupRequests.id, entry.id), blockedStageHandoff()));
+            if (pendingStage) next = stageHandoffRetryDueAt(pendingStage.payload, pendingStage.updatedAt);
+          }
         }
         if (errors.length) throw new AggregateError(errors, `Deferred receipt ${entry.id} could not settle`);
         return next === null ? null : { ...entry, dueAt: next };

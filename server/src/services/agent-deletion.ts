@@ -1,3 +1,4 @@
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { notifyStatusCardIssueChange } from "./status-card-notifications.js";
 import { notifyAttentionRetentionWork } from "./retention-work-notifications.js";
 import { DELIVERY_QUEUES, notifyDeliveryWork } from "./delivery-work-notifications.js";
@@ -8,10 +9,10 @@ import { notifyInstructionCollection } from "./instruction-collection-notificati
 import { notifyDirectoryCleanup } from "./directory-cleanup-notifications.js";
 import { notifyInstructionCommit } from "./instruction-commit-notifications.js";
 import { notifyScheduledRetryCancellation } from "./scheduled-retry-cancellation-notifications.js";
-import { and, eq, or, sql } from "drizzle-orm";
+import { and, eq, inArray, or, sql } from "drizzle-orm";
 import { agents, agentApiKeys, agentRuntimeState, agentTaskSessions, agentWakeupRequests, activityLog,
   budgetReservations, heartbeatRunEvents, heartbeatRuns, issueExecutionDecisions, issues, issueComments,
-  caseHandoffs, principalPermissionGrants, type Db } from "@paperclipai/db";
+  caseHandoffs, issueRecoveryActions, principalPermissionGrants, type Db } from "@paperclipai/db";
 import { conflict } from "../errors.js";
 import { issueThreadInteractionService } from "./issue-thread-interactions.js";
 
@@ -47,6 +48,15 @@ export async function deleteAgentDependencies(tx: Db, companyId: string, id: str
     .update(issues)
     .set({ assigneeAgentId: null, createdByAgentId: null })
     .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+  // A deleted participant can no longer satisfy its retained stage handoff.
+  // Cancel only this notice; unrelated reconciliation ownership stays intact.
+  const handoffHolds = await tx.select({ id: issueRecoveryActions.id, issueId: issueRecoveryActions.sourceIssueId })
+    .from(issueRecoveryActions).where(and(eq(issueRecoveryActions.companyId, companyId),
+      eq(issueRecoveryActions.returnOwnerAgentId, id), eq(issueRecoveryActions.cause, "stage_handoff_retry_exhausted"),
+      inArray(issueRecoveryActions.status, ["active", "escalated"])));
+  for (const hold of handoffHolds) await issueRecoveryActionService(tx).resolveActiveForIssue({
+    companyId, sourceIssueId: hold.issueId, actionId: hold.id, cause: "stage_handoff_retry_exhausted",
+    status: "cancelled", outcome: "cancelled", resolutionNote: "The handoff participant was deleted." });
   await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
   await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
   await tx.delete(activityLog).where(

@@ -1,3 +1,4 @@
+import { issueRecoveryActionService } from "./issue-recovery-actions.js";
 import { notifyStrandedAgentStatus, notifyActiveRunSilence } from "./live-run-recovery-notifications.js";
 import { finishedIdleWake } from "./idle-work-proof.js";
 import { notifyDeferredExecutionEligibility } from "./deferred-execution-notifications.js";
@@ -11632,6 +11633,20 @@ export function issueService(db: Db) {
           .returning()
           .then((rows: Array<typeof issues.$inferSelect>) => rows[0] ?? null);
         if (!updated) return null;
+        if (patch.status !== undefined || patch.assigneeAgentId !== undefined || patch.executionState !== undefined) {
+          const recovery = issueRecoveryActionService(tx);
+          const action = await recovery.getActiveForIssue(updated.companyId, updated.id);
+          if (action?.cause === "stage_handoff_retry_exhausted") {
+            const state = updated.executionState;
+            if (["done", "cancelled"].includes(updated.status) || updated.assigneeAgentId !== action.returnOwnerAgentId
+              || state?.status !== "pending" || state?.currentStageId !== action.evidence?.stageId
+              || (state?.currentParticipant as { agentId?: unknown } | undefined)?.agentId !== action.returnOwnerAgentId) {
+              await recovery.resolveActiveForIssue({ companyId: updated.companyId, sourceIssueId: updated.id,
+                actionId: action.id, cause: action.cause, fingerprint: action.fingerprint,
+                status: "cancelled", outcome: "cancelled", resolutionNote: "The task no longer waits on this handoff." });
+            }
+          }
+        }
         if (updated.status === "done") {
           await completeTerminalCaseHandoffsForIssue(tx, { companyId: updated.companyId, issueId: updated.id,
             publications: activityPublications });
